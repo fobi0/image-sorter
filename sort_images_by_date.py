@@ -1,19 +1,22 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.9"
 # dependencies = ["pillow", "pillow-heif"]
 # ///
 """Sort images into <dest>/<year>/<month>/<filename> using their EXIF capture date.
 
 Walks every subfolder of the given path. Filenames are never changed: if the
 target already contains a file with the same name, the image is skipped and
-reported. Images without a usable EXIF date are left where they are.
+reported. Images without a usable EXIF date are sorted by the file's creation
+date instead (or left in place with --exif-only).
 
 Usage:
     ./sort_images_by_date.py ~/Pictures/unsorted --dry-run
     ./sort_images_by_date.py ~/Pictures/unsorted
     ./sort_images_by_date.py ~/Pictures/unsorted --dest ~/Pictures/sorted --copy
 """
+
+from __future__ import annotations
 
 import argparse
 import shutil
@@ -61,12 +64,28 @@ def exif_date(path: Path) -> datetime | None:
     return None
 
 
+def file_date(path: Path) -> datetime:
+    """Return the file's creation date, or its modification date if that is earlier.
+
+    Copying a file resets its creation date but usually keeps the modification
+    date, so the earlier of the two is the better guess for when it was taken.
+    Creation date: st_birthtime on macOS (and Windows with Python 3.12+), st_ctime
+    on older Windows Pythons. Linux doesn't expose it, so only mtime is used there.
+    """
+    st = path.stat()
+    created = getattr(st, "st_birthtime", None)
+    if created is None:
+        created = st.st_ctime if sys.platform == "win32" else st.st_mtime
+    return datetime.fromtimestamp(min(created, st.st_mtime))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("source", type=Path, help="folder to scan recursively")
     parser.add_argument("--dest", type=Path, help="target root folder (default: same as source)")
     parser.add_argument("--copy", action="store_true", help="copy instead of move")
     parser.add_argument("--dry-run", action="store_true", help="only print what would happen")
+    parser.add_argument("--exif-only", action="store_true", help="leave images without EXIF date in place")
     parser.add_argument("--keep-empty", action="store_true", help="don't remove folders emptied by the move")
     args = parser.parse_args()
 
@@ -80,13 +99,17 @@ def main() -> int:
     files = sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
 
     planned: set[Path] = set()
-    moved = skipped_no_date = skipped_conflict = already_sorted = 0
+    moved = skipped_no_date = used_file_date = skipped_conflict = already_sorted = 0
     for path in files:
         taken = exif_date(path)
         if taken is None:
-            print(f"no EXIF date, left in place: {path}")
-            skipped_no_date += 1
-            continue
+            if args.exif_only:
+                print(f"no EXIF date, left in place: {path}")
+                skipped_no_date += 1
+                continue
+            taken = file_date(path)
+            print(f"no EXIF date, using file date {taken:%Y-%m-%d}: {path}")
+            used_file_date += 1
 
         target = dest / f"{taken.year:04d}" / f"{taken.month:02d}" / path.name
         if target == path:
@@ -119,7 +142,8 @@ def main() -> int:
     prefix = "[dry run] would have " if args.dry_run else ""
     print(
         f"\n{prefix}{verb} {moved}, already sorted {already_sorted}, "
-        f"no EXIF date {skipped_no_date}, name conflicts {skipped_conflict}"
+        f"sorted by file date {used_file_date}, no EXIF date (left in place) {skipped_no_date}, "
+        f"name conflicts {skipped_conflict}"
     )
     return 0
 
